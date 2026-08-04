@@ -4,26 +4,33 @@
  * Computación Paralela - CC3069
  *
  * Autores:
- *   - Angie Vela, 23764 
+ *   - Angie Vela, 23764
  *   - Javier Linares, 231135
  *   - Roberto Camposeco, 23968
  *
  * Archivo: contador_paralelo.c
- * Descripción: Implementa un contador paralelo de frecuencia de palabras
- *              utilizando hilos POSIX (pthreads). Lee las palabras de
- *              texto.txt, las divide entre tres hilos y utiliza un
- *              diccionario global implementado como tabla hash para
- *              almacenar la frecuencia de cada palabra.
+ * Descripción: Implementa un contador paralelo de frecuencia de
+ *              palabras utilizando hilos POSIX (pthreads). Lee las
+ *              palabras de texto.txt, calcula el total y las divide
+ *              en NUM_HILOS bloques de tamano similar. Cada hilo
+ *              recibe un bloque y cuenta sus palabras en un
+ *              diccionario local propio (tabla hash independiente),
+ *              sin tocar memoria compartida durante el conteo, por
+ *              lo que ya no se necesita usar mutex.
  *
- *              El acceso al diccionario y al contador global de palabras
- *              es protegido mediante un mutex para evitar condiciones
- *              de carrera entre los hilos.
+ *              La sincronizacion entre hilos se logra con
+ *              pthread_join: el hilo principal espera a que todos
+ *              terminen antes de continuar. Una vez sincronizados,
+ *              el hilo principal combina (merge) los NUM_HILOS
+ *              diccionarios parciales en un unico diccionario
+ *              global, de forma secuencial.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #define NOMBRE_ARCHIVO "texto.txt"
 #define NUM_HILOS 3
@@ -37,21 +44,19 @@ typedef struct Nodo {
     struct Nodo *siguiente;
 } Nodo;
 
-Nodo *tabla_hash[TABLE_SIZE];   /* diccionario global */
-int total_palabras = 0;         /* total global */
-
-/* Mutex que protege diccionario y total_palabras (recursos compartidos) */
-pthread_mutex_t mutex_diccionario = PTHREAD_MUTEX_INITIALIZER;
-
-/* Lista de palabras leidas del archivo (se llena antes de crear hilos) */
+/* Lista de palabras leidas del archivo (solo lectura durante el
+   conteo, todos los hilos leen del mismo arreglo, cada uno en su
+   propio rango */
 char **palabras = NULL;
 int cantidad_palabras = 0;
 
-/* Argumentos que recibe cada hilo: el bloque [inicio, fin) que le toca */
+/* Argumentos que recibe cada hilo */
 typedef struct {
     int id_hilo;
     int inicio;
     int fin;
+    Nodo **tabla_local;   /* diccionario propio del hilo (conteo parcial) */
+    int total_local;      /* contador propio del hilo */
 } ArgsHilo;
 
 /* ---------- Funcion hash simple (djb2) ---------- */
@@ -65,19 +70,19 @@ unsigned int funcion_hash(const char *str) {
 }
 
 /*
- * Busca la palabra en el diccionario:
- *  - si existe, incrementa su frecuencia
- *  - si no existe, la inserta con frecuencia 1
- * NOTA: esta funcion NO es thread-safe por si sola; siempre se llama
- * dentro de la seccion protegida por mutex_diccionario.
+ * Busca la palabra en una tabla y le suma cantidad a su frecuencia
+ * (la inserta con esa frecuencia si no existia todavia).
+ * Se usa tanto para el conteo local de cada hilo (cantidad = 1, una
+ * palabra a la vez) como para la combinacion final en el hilo
+ * principal (cantidad = frecuencia parcial de cada hilo).
  */
-void insertar_o_incrementar(const char *palabra) {
+void insertar_o_sumar(Nodo *tabla[], const char *palabra, int cantidad) {
     unsigned int indice = funcion_hash(palabra);
-    Nodo *actual = tabla_hash[indice];
+    Nodo *actual = tabla[indice];
 
     while (actual != NULL) {
         if (strcmp(actual->palabra, palabra) == 0) {
-            actual->frecuencia += 1;
+            actual->frecuencia += cantidad;
             return;
         }
         actual = actual->siguiente;
@@ -90,67 +95,57 @@ void insertar_o_incrementar(const char *palabra) {
     }
     strncpy(nuevo->palabra, palabra, MAX_PALABRA - 1);
     nuevo->palabra[MAX_PALABRA - 1] = '\0';
-    nuevo->frecuencia = 1;
-    nuevo->siguiente = tabla_hash[indice];
-    tabla_hash[indice] = nuevo;
+    nuevo->frecuencia = cantidad;
+    nuevo->siguiente = tabla[indice];
+    tabla[indice] = nuevo;
 }
 
 /*
  * Funcion que ejecuta cada hilo.
- * Recorre el bloque de palabras [inicio, fin) que le fue asignado y por
- * cada una: verifica si esta en el diccionario, incrementa o inserta, y
- * actualiza el total. Toda esta seccion es critica porque el diccionario
- * y el total son compartidos entre los 3 hilos.
+ * Recorre el bloque de palabras [inicio, fin) que le fue asignado y
+ * construye su propio diccionario local. 
  */
 void *contar_palabras(void *args) {
     ArgsHilo *a = (ArgsHilo *)args;
     int i = a->inicio;
 
-    while (i < a->fin) {              /* ¿hay mas palabras por leer en mi bloque? */
-        char *p = palabras[i];         /* leer la palabra */
-
-        pthread_mutex_lock(&mutex_diccionario);   /* --- inicio seccion critica --- */
-        insertar_o_incrementar(p);
-        total_palabras += 1;
-        pthread_mutex_unlock(&mutex_diccionario); /* --- fin seccion critica --- */
-
+    while (i < a->fin) {                  // hay mas palabras por leer en mi bloque? 
+        char *p = palabras[i];            // leer palabra
+        insertar_o_sumar(a->tabla_local, p, 1);
+        a->total_local++;
         i++;
     }
 
-    printf("Hilo %d finalizo: proceso %d palabras (rango [%d, %d))\n",
+    printf("Hilo %d finalizo: proceso %d palabras (rango [%d, %d)) en su diccionario local\n",
            a->id_hilo, a->fin - a->inicio, a->inicio, a->fin);
 
     return NULL;
 }
 
-/* Libera toda la memoria dinamica usada (diccionario y arreglo de palabras) */
-void liberar_recursos(void) {
+/* Libera toda la memoria dinamica de una tabla */
+void liberar_tabla(Nodo *tabla[]) {
     for (int i = 0; i < TABLE_SIZE; i++) {
-        Nodo *actual = tabla_hash[i];
+        Nodo *actual = tabla[i];
         while (actual != NULL) {
             Nodo *tmp = actual;
             actual = actual->siguiente;
             free(tmp);
         }
     }
-    for (int i = 0; i < cantidad_palabras; i++) {
-        free(palabras[i]);
-    }
-    free(palabras);
 }
 
 /* Muestra el diccionario completo y el total de palabras */
-void mostrar_resultados(void) {
-    printf("\n===== RESULTADOS FINALES =====\n");
+void mostrar_resultados(Nodo *tabla[], int total) {
+    printf("\n===== RESULTADOS FINALES (PARALELO) =====\n");
     for (int i = 0; i < TABLE_SIZE; i++) {
-        Nodo *actual = tabla_hash[i];
+        Nodo *actual = tabla[i];
         while (actual != NULL) {
             printf("%-20s -> %d\n", actual->palabra, actual->frecuencia);
             actual = actual->siguiente;
         }
     }
     printf("-------------------------------\n");
-    printf("Total de palabras contadas: %d\n", total_palabras);
+    printf("Total de palabras contadas: %d\n", total);
 }
 
 int main(void) {
@@ -163,15 +158,11 @@ int main(void) {
         return 1;
     }
 
-    /* Inicializar el diccionario vacio */
-    for (int i = 0; i < TABLE_SIZE; i++) {
-        tabla_hash[i] = NULL;
-    }
-    /* total_palabras ya inicia en 0 por ser variable global */
+    /* Inicializar el diccionario global vacio y el total en 0 */
+    Nodo *tabla_global[TABLE_SIZE] = { NULL };
+    int total_palabras = 0;
 
-    /* Leer todas las palabras del archivo hacia un arreglo dinamico.
-          Esto nos permite conocer la cantidad total de palabras y
-          dividirlas en bloques iguales para cada hilo. */
+    /* Leer todas las palabras del archivo hacia un arreglo dinamico */
     int capacidad = 100;
     palabras = (char **)malloc((size_t)capacidad * sizeof(char *));
     if (palabras == NULL) {
@@ -187,7 +178,6 @@ int main(void) {
             char **tmp = (char **)realloc(palabras, (size_t)capacidad * sizeof(char *));
             if (tmp == NULL) {
                 fprintf(stderr, "Error: no hay memoria disponible.\n");
-                liberar_recursos();
                 fclose(archivo);
                 return 1;
             }
@@ -202,16 +192,18 @@ int main(void) {
         strcpy(palabras[cantidad_palabras], buffer);
         cantidad_palabras++;
     }
+    fclose(archivo);
 
     /* Validacion: la cantidad de palabras debe ser > 0 */
     if (cantidad_palabras == 0) {
         printf("Error: el archivo no contiene palabras.\n");
-        fclose(archivo);
         free(palabras);
         return 1;
     }
 
     printf("Se leyeron %d palabras del archivo.\n", cantidad_palabras);
+
+    clock_t inicio = clock();
 
     /* Dividir en partes iguales y asignar un bloque a cada hilo */
     pthread_t hilos[NUM_HILOS];
@@ -219,16 +211,23 @@ int main(void) {
 
     int base = cantidad_palabras / NUM_HILOS;
     int resto = cantidad_palabras % NUM_HILOS;
-    int inicio = 0;
+    int inicio_bloque = 0;
 
     for (int i = 0; i < NUM_HILOS; i++) {
-        /* Los primeros "resto" hilos reciben una palabra extra para que
-           la division quede lo mas pareja posible */
         int tam_bloque = base + (i < resto ? 1 : 0);
         args[i].id_hilo = i + 1;
-        args[i].inicio = inicio;
-        args[i].fin = inicio + tam_bloque;
-        inicio += tam_bloque;
+        args[i].inicio = inicio_bloque;
+        args[i].fin = inicio_bloque + tam_bloque;
+        args[i].total_local = 0;
+
+        /* Cada hilo recibe su propia tabla hash local, ya inicializada en NULL */
+        args[i].tabla_local = (Nodo **)calloc(TABLE_SIZE, sizeof(Nodo *));
+        if (args[i].tabla_local == NULL) {
+            fprintf(stderr, "Error: no hay memoria disponible.\n");
+            return 1;
+        }
+
+        inicio_bloque += tam_bloque;
     }
 
     /* Crear e iniciar los hilos */
@@ -239,20 +238,41 @@ int main(void) {
         }
     }
 
-    /* Esperar a que todos los hilos terminen (join) */
+    /* Esperar a que todos los hilos terminen (join)
+          Este es el punto de sincronizacion, nadie puede combinar
+          resultados hasta que todos los hilos hayan terminado */
     for (int i = 0; i < NUM_HILOS; i++) {
         pthread_join(hilos[i], NULL);
     }
 
-    /* Cerrar el archivo */
-    fclose(archivo);
+    /* Combinar los diccionarios locales en el diccionario global */
+    for (int i = 0; i < NUM_HILOS; i++) {
+        for (int b = 0; b < TABLE_SIZE; b++) {
+            Nodo *actual = args[i].tabla_local[b];
+            while (actual != NULL) {
+                insertar_o_sumar(tabla_global, actual->palabra, actual->frecuencia);
+                actual = actual->siguiente;
+            }
+        }
+        total_palabras += args[i].total_local;
+        liberar_tabla(args[i].tabla_local);
+        free(args[i].tabla_local);
+    }
+
+    clock_t fin = clock();
+    double segundos = (double)(fin - inicio) / CLOCKS_PER_SEC;
 
     /* mostrar resultados finales */
-    mostrar_resultados();
+    mostrar_resultados(tabla_global, total_palabras);
+    printf("Tiempo de ejecucion (paralelo, %d hilos): %.6f segundos\n", NUM_HILOS, segundos);
 
-    /* Liberar memoria y destruir el mutex */
-    liberar_recursos();
-    pthread_mutex_destroy(&mutex_diccionario);
+    /* Liberar memoria */
+    liberar_tabla(tabla_global);
+    for (int i = 0; i < cantidad_palabras; i++) {
+        free(palabras[i]);
+    }
+    free(palabras);
 
+    /* Finalizar el programa */
     return 0;
 }

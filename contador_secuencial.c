@@ -4,20 +4,16 @@
  * Computación Paralela - CC3069
  *
  * Autores:
- *   - Angie Vela, 23764 
+ *   - Angie Vela, 23764
  *   - Javier Linares, 231135
  *   - Roberto Camposeco, 23968
  *
  * Archivo: contador_secuencial.c
- * Descripción: Implementa un contador secuencial de frecuencia de palabras.
- *              Lee las palabras del archivo texto.txt y las procesa una
- *              por una utilizando un único flujo de ejecución, sin hilos
- *              ni mecanismos de sincronización.
- *
- *              Utiliza un diccionario implementado mediante una tabla hash
- *              con encadenamiento para almacenar la frecuencia de cada
- *              palabra. El tiempo de ejecución del conteo es medido para
- *              compararlo con la versión paralela basada en pthreads.
+ * Descripción: Implementa un contador secuencial de frecuencia de
+ *              palabras. Lee texto.txt con un unico flujo de
+ *              ejecucion, procesa las palabras una por una y las
+ *              almacena en un diccionario implementado como tabla
+ *              hash. 
  */
 
 #include <stdio.h>
@@ -36,13 +32,7 @@ typedef struct Nodo {
     struct Nodo *siguiente;
 } Nodo;
 
-Nodo *tabla_hash[TABLE_SIZE];
-int total_palabras = 0;
-
-char **palabras = NULL;
-int cantidad_palabras = 0;
-
-/* ---------- Funcion hash simple (djb2), identica a la version paralela ---------- */
+/* ---------- Funcion hash simple (djb2) ---------- */
 unsigned int funcion_hash(const char *str) {
     unsigned int hash = 5381;
     int c;
@@ -53,13 +43,13 @@ unsigned int funcion_hash(const char *str) {
 }
 
 /*
- * Busca la palabra en el diccionario:
+ * Busca la palabra en la tabla:
  *  - si existe, incrementa su frecuencia
  *  - si no existe, la inserta con frecuencia 1
  */
-void insertar_o_incrementar(const char *palabra) {
+void insertar_o_incrementar(Nodo *tabla[], const char *palabra) {
     unsigned int indice = funcion_hash(palabra);
-    Nodo *actual = tabla_hash[indice];
+    Nodo *actual = tabla[indice];
 
     while (actual != NULL) {
         if (strcmp(actual->palabra, palabra) == 0) {
@@ -77,55 +67,38 @@ void insertar_o_incrementar(const char *palabra) {
     strncpy(nuevo->palabra, palabra, MAX_PALABRA - 1);
     nuevo->palabra[MAX_PALABRA - 1] = '\0';
     nuevo->frecuencia = 1;
-    nuevo->siguiente = tabla_hash[indice];
-    tabla_hash[indice] = nuevo;
+    nuevo->siguiente = tabla[indice];
+    tabla[indice] = nuevo;
 }
 
-/*
- * Recorre TODAS las palabras leidas del archivo, una por una,
- * y actualiza el diccionario y el total. Equivale a lo que hacia
- * cada hilo en la version paralela, pero aqui sobre el arreglo completo.
- */
-void contar_palabras_secuencial(void) {
-    for (int i = 0; i < cantidad_palabras; i++) {
-        char *p = palabras[i];
-        insertar_o_incrementar(p);
-        total_palabras += 1;
-    }
-}
-
-/* Libera toda la memoria dinamica usada */
-void liberar_recursos(void) {
+/* Libera toda la memoria dinamica de una tabla */
+void liberar_tabla(Nodo *tabla[]) {
     for (int i = 0; i < TABLE_SIZE; i++) {
-        Nodo *actual = tabla_hash[i];
+        Nodo *actual = tabla[i];
         while (actual != NULL) {
             Nodo *tmp = actual;
             actual = actual->siguiente;
             free(tmp);
         }
     }
-    for (int i = 0; i < cantidad_palabras; i++) {
-        free(palabras[i]);
-    }
-    free(palabras);
 }
 
 /* Muestra el diccionario completo y el total de palabras */
-void mostrar_resultados(void) {
-    printf("\n===== RESULTADOS FINALES =====\n");
+void mostrar_resultados(Nodo *tabla[], int total) {
+    printf("\n===== RESULTADOS FINALES (SECUENCIAL) =====\n");
     for (int i = 0; i < TABLE_SIZE; i++) {
-        Nodo *actual = tabla_hash[i];
+        Nodo *actual = tabla[i];
         while (actual != NULL) {
             printf("%-20s -> %d\n", actual->palabra, actual->frecuencia);
             actual = actual->siguiente;
         }
     }
     printf("-------------------------------\n");
-    printf("Total de palabras contadas: %d\n", total_palabras);
+    printf("Total de palabras contadas: %d\n", total);
 }
 
 int main(void) {
-    /* Abrir el archivo */
+    /* Abrir el archivo (hardcodeado texto.txt) */
     FILE *archivo = fopen(NOMBRE_ARCHIVO, "r");
 
     /* Verificar apertura correcta */
@@ -134,69 +107,39 @@ int main(void) {
         return 1;
     }
 
-    /* Inicializar el diccionario vacio */
-    for (int i = 0; i < TABLE_SIZE; i++) {
-        tabla_hash[i] = NULL;
-    }
-    /* total_palabras ya inicia en 0 por ser variable global */
+    /* Inicializar el diccionario vacio y el total en 0 */
+    Nodo *tabla_hash[TABLE_SIZE] = { NULL };
+    int total_palabras = 0;
 
-    /* Leer todas las palabras del archivo hacia un arreglo dinamico */
-    int capacidad = 100;
-    palabras = (char **)malloc((size_t)capacidad * sizeof(char *));
-    if (palabras == NULL) {
-        fprintf(stderr, "Error: no hay memoria disponible.\n");
-        fclose(archivo);
-        return 1;
-    }
+    clock_t inicio = clock();
 
+    /* Mientras haya mas palabras leer, verificar si esta en el
+       diccionario, incrementar o insertar, y actualizar el total. */
     char buffer[MAX_PALABRA];
     while (fscanf(archivo, "%99s", buffer) == 1) {
-        if (cantidad_palabras >= capacidad) {
-            capacidad *= 2;
-            char **tmp = (char **)realloc(palabras, (size_t)capacidad * sizeof(char *));
-            if (tmp == NULL) {
-                fprintf(stderr, "Error: no hay memoria disponible.\n");
-                liberar_recursos();
-                fclose(archivo);
-                return 1;
-            }
-            palabras = tmp;
-        }
-        palabras[cantidad_palabras] = (char *)malloc(strlen(buffer) + 1);
-        if (palabras[cantidad_palabras] == NULL) {
-            fprintf(stderr, "Error: no hay memoria disponible.\n");
-            fclose(archivo);
-            return 1;
-        }
-        strcpy(palabras[cantidad_palabras], buffer);
-        cantidad_palabras++;
+        insertar_o_incrementar(tabla_hash, buffer);
+        total_palabras++;
     }
 
-    /* Validacion: la cantidad de palabras debe ser > 0 */
-    if (cantidad_palabras == 0) {
+    /* validar cantidad de palabras > 0 */
+    if (total_palabras == 0) {
         printf("Error: el archivo no contiene palabras.\n");
         fclose(archivo);
-        free(palabras);
         return 1;
     }
-
-    printf("Se leyeron %d palabras del archivo.\n", cantidad_palabras);
-
-    /* Contar frecuencias de forma secuencial */
-    clock_t inicio = clock();
-    contar_palabras_secuencial();
-    clock_t fin = clock();
-    double segundos = (double)(fin - inicio) / CLOCKS_PER_SEC;
 
     /* Cerrar el archivo */
     fclose(archivo);
 
-    /* Mostrar resultados finales */
-    mostrar_resultados();
-    printf("Tiempo de conteo (secuencial): %.6f segundos\n", segundos);
+    clock_t fin = clock();
+    double segundos = (double)(fin - inicio) / CLOCKS_PER_SEC;
 
-    /* Liberar memoria */
-    liberar_recursos();
+    /* mostrar resultados finales */
+    mostrar_resultados(tabla_hash, total_palabras);
+    printf("Tiempo de ejecucion (secuencial): %.6f segundos\n", segundos);
 
+    liberar_tabla(tabla_hash);
+
+    /* finalizar el programa */
     return 0;
 }
