@@ -1,0 +1,4 @@
+version,tiempo_prom,speedup,efficiency
+secuencial,0.109000,1.0000,1.0000
+paralelo_2hilos,0.055800,1.9534,0.9767
+paralelo_4hilos,0.035400,3.0791,0.7698

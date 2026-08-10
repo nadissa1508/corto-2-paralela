@@ -111,34 +111,77 @@ int main(void) {
     Nodo *tabla_hash[TABLE_SIZE] = { NULL };
     int total_palabras = 0;
 
-    clock_t inicio = clock();
+    /* El cronometro total arranca antes de leer, igual que en la
+       version paralela, para que el tiempo total sea comparable. */
+    clock_t inicio_total = clock();
 
-    /* Mientras haya mas palabras leer, verificar si esta en el
-       diccionario, incrementar o insertar, y actualizar el total. */
-    char buffer[MAX_PALABRA];
-    while (fscanf(archivo, "%99s", buffer) == 1) {
-        insertar_o_incrementar(tabla_hash, buffer);
-        total_palabras++;
-    }
-
-    /* validar cantidad de palabras > 0 */
-    if (total_palabras == 0) {
-        printf("Error: el archivo no contiene palabras.\n");
+    /* ---- Fase 1: lectura del archivo hacia un arreglo en memoria ---- */
+    int capacidad = 100;
+    char **palabras = (char **)malloc((size_t)capacidad * sizeof(char *));
+    if (palabras == NULL) {
+        fprintf(stderr, "Error: no hay memoria disponible.\n");
         fclose(archivo);
         return 1;
+    }
+
+    int cantidad_palabras = 0;
+    char buffer[MAX_PALABRA];
+    while (fscanf(archivo, "%99s", buffer) == 1) {
+        if (cantidad_palabras >= capacidad) {
+            capacidad *= 2;
+            char **tmp = (char **)realloc(palabras, (size_t)capacidad * sizeof(char *));
+            if (tmp == NULL) {
+                fprintf(stderr, "Error: no hay memoria disponible.\n");
+                fclose(archivo);
+                return 1;
+            }
+            palabras = tmp;
+        }
+        palabras[cantidad_palabras] = (char *)malloc(strlen(buffer) + 1);
+        if (palabras[cantidad_palabras] == NULL) {
+            fprintf(stderr, "Error: no hay memoria disponible.\n");
+            fclose(archivo);
+            return 1;
+        }
+        strcpy(palabras[cantidad_palabras], buffer);
+        cantidad_palabras++;
     }
 
     /* Cerrar el archivo */
     fclose(archivo);
 
-    clock_t fin = clock();
-    double segundos = (double)(fin - inicio) / CLOCKS_PER_SEC;
+    /* validar cantidad de palabras > 0 */
+    if (cantidad_palabras == 0) {
+        printf("Error: el archivo no contiene palabras.\n");
+        free(palabras);
+        return 1;
+    }
+
+    clock_t fin_lectura = clock();
+
+    /* ---- Fase 2: conteo secuencial sobre el arreglo ya leido ---- */
+    for (int i = 0; i < cantidad_palabras; i++) {
+        insertar_o_incrementar(tabla_hash, palabras[i]);
+        total_palabras++;
+    }
+
+    clock_t fin_conteo = clock();
+
+    double t_lectura = (double)(fin_lectura - inicio_total) / CLOCKS_PER_SEC;
+    double t_conteo  = (double)(fin_conteo - fin_lectura) / CLOCKS_PER_SEC;
+    double t_total   = (double)(fin_conteo - inicio_total) / CLOCKS_PER_SEC;
 
     /* mostrar resultados finales */
     mostrar_resultados(tabla_hash, total_palabras);
-    printf("Tiempo de ejecucion (secuencial): %.6f segundos\n", segundos);
+    printf("Tiempo de lectura del archivo:        %.6f segundos\n", t_lectura);
+    printf("Tiempo de conteo (secuencial):         %.6f segundos\n", t_conteo);
+    printf("Tiempo de ejecucion total:              %.6f segundos\n", t_total);
 
     liberar_tabla(tabla_hash);
+    for (int i = 0; i < cantidad_palabras; i++) {
+        free(palabras[i]);
+    }
+    free(palabras);
 
     /* finalizar el programa */
     return 0;

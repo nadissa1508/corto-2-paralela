@@ -33,7 +33,8 @@
 #include <time.h>
 
 #define NOMBRE_ARCHIVO "texto.txt"
-#define NUM_HILOS 3
+#define NUM_HILOS_DEFAULT 3
+#define MAX_HILOS 64
 #define TABLE_SIZE 211
 #define MAX_PALABRA 100
 
@@ -148,7 +149,20 @@ void mostrar_resultados(Nodo *tabla[], int total) {
     printf("Total de palabras contadas: %d\n", total);
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    /* Cantidad de hilos: se puede indicar por linea de comandos
+       (./contador_paralelo N), si no se especifica se usa el valor
+       por defecto. Permite correr benchmarks con distinta cantidad
+       de hilos sin recompilar. */
+    int num_hilos = NUM_HILOS_DEFAULT;
+    if (argc >= 2) {
+        num_hilos = atoi(argv[1]);
+        if (num_hilos < 1 || num_hilos > MAX_HILOS) {
+            fprintf(stderr, "Error: numero de hilos invalido (debe ser entre 1 y %d)\n", MAX_HILOS);
+            return 1;
+        }
+    }
+
     /* Abrir el archivo */
     FILE *archivo = fopen(NOMBRE_ARCHIVO, "r");
 
@@ -162,7 +176,11 @@ int main(void) {
     Nodo *tabla_global[TABLE_SIZE] = { NULL };
     int total_palabras = 0;
 
-    /* Leer todas las palabras del archivo hacia un arreglo dinamico */
+    /* El cronometro total arranca antes de leer, igual que en la
+       version secuencial, para que el tiempo total sea comparable. */
+    clock_t inicio_total = clock();
+
+    /* ---- Fase 1: lectura del archivo hacia un arreglo dinamico ---- */
     int capacidad = 100;
     palabras = (char **)malloc((size_t)capacidad * sizeof(char *));
     if (palabras == NULL) {
@@ -201,19 +219,21 @@ int main(void) {
         return 1;
     }
 
+    clock_t fin_lectura = clock();
+
     printf("Se leyeron %d palabras del archivo.\n", cantidad_palabras);
 
-    clock_t inicio = clock();
+    /* ---- Fase 2: division de bloques, hilos, conteo paralelo y merge ---- */
 
     /* Dividir en partes iguales y asignar un bloque a cada hilo */
-    pthread_t hilos[NUM_HILOS];
-    ArgsHilo args[NUM_HILOS];
+    pthread_t hilos[MAX_HILOS];
+    ArgsHilo args[MAX_HILOS];
 
-    int base = cantidad_palabras / NUM_HILOS;
-    int resto = cantidad_palabras % NUM_HILOS;
+    int base = cantidad_palabras / num_hilos;
+    int resto = cantidad_palabras % num_hilos;
     int inicio_bloque = 0;
 
-    for (int i = 0; i < NUM_HILOS; i++) {
+    for (int i = 0; i < num_hilos; i++) {
         int tam_bloque = base + (i < resto ? 1 : 0);
         args[i].id_hilo = i + 1;
         args[i].inicio = inicio_bloque;
@@ -231,7 +251,7 @@ int main(void) {
     }
 
     /* Crear e iniciar los hilos */
-    for (int i = 0; i < NUM_HILOS; i++) {
+    for (int i = 0; i < num_hilos; i++) {
         if (pthread_create(&hilos[i], NULL, contar_palabras, &args[i]) != 0) {
             fprintf(stderr, "Error: no se pudo crear el hilo %d\n", i + 1);
             return 1;
@@ -241,12 +261,12 @@ int main(void) {
     /* Esperar a que todos los hilos terminen (join)
           Este es el punto de sincronizacion, nadie puede combinar
           resultados hasta que todos los hilos hayan terminado */
-    for (int i = 0; i < NUM_HILOS; i++) {
+    for (int i = 0; i < num_hilos; i++) {
         pthread_join(hilos[i], NULL);
     }
 
     /* Combinar los diccionarios locales en el diccionario global */
-    for (int i = 0; i < NUM_HILOS; i++) {
+    for (int i = 0; i < num_hilos; i++) {
         for (int b = 0; b < TABLE_SIZE; b++) {
             Nodo *actual = args[i].tabla_local[b];
             while (actual != NULL) {
@@ -259,12 +279,17 @@ int main(void) {
         free(args[i].tabla_local);
     }
 
-    clock_t fin = clock();
-    double segundos = (double)(fin - inicio) / CLOCKS_PER_SEC;
+    clock_t fin_conteo = clock();
+
+    double t_lectura = (double)(fin_lectura - inicio_total) / CLOCKS_PER_SEC;
+    double t_conteo  = (double)(fin_conteo - fin_lectura) / CLOCKS_PER_SEC;
+    double t_total   = (double)(fin_conteo - inicio_total) / CLOCKS_PER_SEC;
 
     /* mostrar resultados finales */
     mostrar_resultados(tabla_global, total_palabras);
-    printf("Tiempo de ejecucion (paralelo, %d hilos): %.6f segundos\n", NUM_HILOS, segundos);
+    printf("Tiempo de lectura del archivo:        %.6f segundos\n", t_lectura);
+    printf("Tiempo de conteo (paralelo, %d hilos):  %.6f segundos\n", num_hilos, t_conteo);
+    printf("Tiempo de ejecucion total:              %.6f segundos\n", t_total);
 
     /* Liberar memoria */
     liberar_tabla(tabla_global);
